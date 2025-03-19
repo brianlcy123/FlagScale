@@ -103,6 +103,10 @@ class Attention(MegatronModule, ABC):
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
+        # To support both CUDA Graphs and key value with different hidden size
+        self.key_hidden_size = self.hidden_size_per_attention_head
+        self.val_hidden_size = self.hidden_size_per_attention_head
+
         self.core_attention = build_module(
             submodules.core_attention,
             config=self.config,
@@ -110,6 +114,7 @@ class Attention(MegatronModule, ABC):
             attn_mask_type=self.attn_mask_type,
             attention_type=self.attention_type,
             cp_comm_type=cp_comm_type,
+            softmax_scale=self.config.softmax_scale,
         )
 
         self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
@@ -189,6 +194,7 @@ class Attention(MegatronModule, ABC):
         rotary_pos_emb: Tensor,
         rotary_pos_cos: Tensor = None,
         rotary_pos_sin: Tensor = None,
+        sequence_len_offset=None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
         Saves the generated key and value tensors to the end of the buffers in inference_params.
@@ -209,10 +215,10 @@ class Attention(MegatronModule, ABC):
             inf_max_seq_length = inference_params.max_sequence_length
             inf_max_batch_size = inference_params.max_batch_size
             inference_key_memory = self._allocate_memory(
-                inf_max_seq_length, inf_max_batch_size, key.shape[-1], key.dtype
+                inf_max_seq_length, inf_max_batch_size, self.key_hidden_size, key.dtype
             )
             inference_value_memory = self._allocate_memory(
-                inf_max_seq_length, inf_max_batch_size, value.shape[-1], value.dtype
+                inf_max_seq_length, inf_max_batch_size, self.val_hidden_size, value.dtype
             )
             inference_params.key_value_memory_dict[self.layer_number] = (
                 inference_key_memory,
@@ -234,7 +240,10 @@ class Attention(MegatronModule, ABC):
         assert batch_end <= inference_key_memory.size(1)
         sequence_start = inference_params.sequence_len_offset
         sequence_end = sequence_start + key.size(0)
-        assert sequence_end <= inference_key_memory.size(0)
+        assert sequence_end <= inference_key_memory.size(0), (
+            "Current sequence length is longer than expected maximum sequence length! "
+            "Increase inference_max_seq_length."
+        )
 
         if self.config.flash_decode:
             assert (
@@ -245,7 +254,7 @@ class Attention(MegatronModule, ABC):
                 rotary_pos_sin_q = rotary_pos_sin[sequence_end - 1 : sequence_end]
                 rotary_pos_cos_k = rotary_pos_cos[sequence_end - 1 : sequence_end]
                 rotary_pos_sin_k = rotary_pos_sin[sequence_end - 1 : sequence_end]
-            else:
+            else:  # Prefill
                 rotary_pos_cos_q = rotary_pos_cos[:sequence_end]
                 rotary_pos_sin_q = rotary_pos_sin[:sequence_end]
                 rotary_pos_cos_k = rotary_pos_cos[:sequence_end]
@@ -304,7 +313,6 @@ class Attention(MegatronModule, ABC):
             "Flash Decoding requires the flash_attn_with_kvcache kernel, "
             "available in the flash-attn package."
         )
-        cache_seqlens = sequence_len_offset - 1
         q = query_layer.permute(1, 0, 2, 3)
         k = key_layer.permute(1, 0, 2, 3)
         v = value_layer.permute(1, 0, 2, 3)
@@ -324,7 +332,7 @@ class Attention(MegatronModule, ABC):
             v=v,
             rotary_cos=rotary_cos,
             rotary_sin=rotary_sin,
-            cache_seqlens=cache_seqlens,
+            cache_seqlens=sequence_len_offset,
             rotary_interleaved=False,
         )
         return out
@@ -340,13 +348,14 @@ class Attention(MegatronModule, ABC):
         rotary_pos_sin=None,
         attention_bias=None,
         packed_seq_params=None,
+        sequence_len_offset=None,
     ):
         """
         Perform a forward pass through the attention module.
         """
 
         # hidden_states: [sq, b, h]
-        if self.config.flash_decode:
+        if self.config.flash_decode and not self.training:
             rotary_pos_emb = None
         else:
             assert rotary_pos_cos is None and rotary_pos_sin is None
@@ -371,15 +380,16 @@ class Attention(MegatronModule, ABC):
         if (
             self.config.flash_decode
             and inference_params is not None
-            and self.layer_number
-            in inference_params.key_value_memory_dict  # Decode phase if key already exists
+            and inference_params.decode_mode
+            and not self.training
         ):
+            assert self.layer_number in inference_params.key_value_memory_dict
             assert inference_params.sequence_len_offset is not None
             inference_key_memory, inference_value_memory = inference_params.key_value_memory_dict[
                 self.layer_number
             ]
             output = self.flash_decoding(
-                sequence_len_offset=inference_params.sequence_len_offset,
+                sequence_len_offset=sequence_len_offset,
                 query_layer=query,
                 key_layer=key,
                 value_layer=value,
@@ -394,7 +404,14 @@ class Attention(MegatronModule, ABC):
             return output, bias
 
         query, key, value, rotary_pos_emb, attn_mask_type = self._adjust_key_value_for_inference(
-            inference_params, query, key, value, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin
+            inference_params,
+            query,
+            key,
+            value,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            sequence_len_offset,
         )
 
         if packed_seq_params is not None:
@@ -508,22 +525,44 @@ class SelfAttention(Attention):
         )
 
         if submodules.q_layernorm is not None:
-            self.q_layernorm = build_module(
-                submodules.q_layernorm,
-                hidden_size=self.hidden_size_per_attention_head,
-                config=self.config,
-                eps=self.config.layernorm_epsilon,
-            )
+            if not self.config.qk_layernorm_hidden_dim:
+                self.q_layernorm = build_module(
+                    submodules.q_layernorm,
+                    hidden_size=self.hidden_size_per_attention_head,
+                    config=self.config,
+                    eps=self.config.layernorm_epsilon,
+                )
+            else:
+                tp_world_size = get_tensor_model_parallel_world_size()
+                assert tp_world_size <= 1, "TP world size must be less than 1 for qk_layernorm_hidden_dim"
+                # nums_head_cur_rank = divide(self.config.num_attention_heads, tp_world_size)
+                self.q_layernorm = build_module(
+                    submodules.q_layernorm,
+                    hidden_size=self.query_projection_size,
+                    config=self.config,
+                    eps=self.config.layernorm_epsilon,
+                )
         else:
             self.q_layernorm = None
 
         if submodules.k_layernorm is not None:
-            self.k_layernorm = build_module(
-                submodules.k_layernorm,
-                hidden_size=self.hidden_size_per_attention_head,
-                config=self.config,
-                eps=self.config.layernorm_epsilon,
-            )
+            if not self.config.qk_layernorm_hidden_dim:
+                self.k_layernorm = build_module(
+                    submodules.k_layernorm,
+                    hidden_size=self.hidden_size_per_attention_head,
+                    config=self.config,
+                    eps=self.config.layernorm_epsilon,
+                )
+            else:
+                tp_world_size = get_tensor_model_parallel_world_size()
+                assert tp_world_size <= 1, "TP world size must be less than 1 for qk_layernorm_hidden_dim"
+                # nums_head_cur_rank = divide(self.config.num_attention_heads, tp_world_size)
+                self.k_layernorm = build_module(
+                    submodules.k_layernorm,
+                    hidden_size=self.kv_projection_size,
+                    config=self.config,
+                    eps=self.config.layernorm_epsilon,
+                )
         else:
             self.k_layernorm = None
 
@@ -640,10 +679,24 @@ class SelfAttention(Attention):
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
 
         if self.q_layernorm is not None:
-            query = self.q_layernorm(query)
+            if not self.config.qk_layernorm_hidden_dim:
+                query = self.q_layernorm(query)
+            else:
+                # [sq, b, np, hn] -> [sq, b, 1, np * hn]
+                query_shape = list(query.shape)
+                query = query.reshape(query.size(0), query.size(1), 1, -1)
+                query = self.q_layernorm(query)
+                query = query.reshape(*query_shape)
 
         if self.k_layernorm is not None:
-            key = self.k_layernorm(key)
+            if not self.config.qk_layernorm_hidden_dim:
+                key = self.k_layernorm(key)
+            else:
+                # [sq, b, ng, hn] -> [sq, b, 1, ng * hn]
+                key_shape = list(key.shape)
+                key = key.reshape(key.size(0), key.size(1), 1, -1)
+                key = self.k_layernorm(key)
+                key = key.reshape(*key_shape)
 
         if self.config.test_mode:
             self.run_realtime_tests()

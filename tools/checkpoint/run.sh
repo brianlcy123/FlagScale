@@ -1,4 +1,30 @@
 # sparse model change the parallel config
+
+python convert.py \
+    --model-type deepseek_v3 \
+    --loader mcore \
+    --saver transformers \
+    --load-dir bf16_model \
+    --save-dir converted_huggingface_model \
+    --target-tensor-parallel-size 1 \
+    --target-pipeline-parallel-size 1 \
+    --target-expert-parallel-size 1 \
+    --target-params-dtype bf16 \
+    --true-vocab-size 151851 \
+
+python convert.py \
+    --model-type deepseek_v3 \
+    --loader transformers \
+    --saver mcore \
+    --load-dir DeepSeek-V2-Lite  \
+    --save-dir converted_bf16_model \
+    --target-tensor-parallel-size 1 \
+    --target-pipeline-parallel-size 2 \
+    --target-decoder-first-pipeline-num-layers 13 \
+    --target-expert-parallel-size 2 \
+    --target-params-dtype bf16 \
+    --true-vocab-size 151851 \
+
 python convert.py \
     --model-type mixtral \
     --loader transformers \

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import List
 
 import ray
@@ -78,7 +80,8 @@ def test_llama_lora(sql_lora_files):
                    enable_lora=True,
                    max_num_seqs=16,
                    max_loras=4,
-                   tensor_parallel_size=1)
+                   tensor_parallel_size=1,
+                   enable_chunked_prefill=True)
     generate_and_test(llm, sql_lora_files)
 
 
@@ -120,6 +123,7 @@ def test_llama_lora_tp4(sql_lora_files):
         max_num_seqs=16,
         max_loras=4,
         tensor_parallel_size=4,
+        enable_chunked_prefill=True,
     )
     generate_and_test(llm, sql_lora_files)
 
@@ -135,6 +139,7 @@ def test_llama_lora_tp4_fully_sharded_loras(sql_lora_files):
         max_loras=4,
         tensor_parallel_size=4,
         fully_sharded_loras=True,
+        enable_chunked_prefill=True,
     )
     generate_and_test(llm, sql_lora_files)
 
@@ -151,5 +156,6 @@ def test_llama_lora_tp4_fully_sharded_enable_bias(sql_lora_files):
         tensor_parallel_size=4,
         fully_sharded_loras=True,
         enable_lora_bias=True,
+        enable_chunked_prefill=True,
     )
     generate_and_test(llm, sql_lora_files)

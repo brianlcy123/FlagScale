@@ -41,7 +41,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
 )
 from flagscale.datasets.sft_dataset import SFTDatasetConfig, SFTDataset
-from flagscale.train.extra_valid import extra_valid_dataset_provider
+from flagscale.train.extra_valid import extra_valid_datasets_provider
 from flagscale.train.train import pretrain
 from flagscale.train.global_vars import get_parallel_context
 
@@ -153,10 +153,10 @@ def get_batch(data_iterator):
 
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
-    
+
     # slice batch along sequence dimension for ulysses sequence parallelism
     batch = get_batch_on_this_ulysses_sp_rank(batch)
-    
+
     return batch.values()
 
 
@@ -250,7 +250,6 @@ def core_gpt_dataset_config_from_args(args):
         sequence_length=args.seq_length,
         blend=blend,
         blend_per_split=blend_per_split,
-        renormalize_blend_weights=args.renormalize_blend_weights,
         split=args.split,
         num_dataset_builder_threads=args.num_dataset_builder_threads,
         path_to_cache=args.data_cache_path,
@@ -277,7 +276,6 @@ def core_sft_dataset_config_from_args(args):
         sequence_length=args.seq_length,
         blend=blend,
         blend_per_split=blend_per_split,
-        renormalize_blend_weights=args.renormalize_blend_weights,
         split=args.split,
         num_dataset_builder_threads=args.num_dataset_builder_threads,
         path_to_cache=args.data_cache_path,
@@ -336,7 +334,7 @@ if __name__ == "__main__":
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
-    extra_valid_dataset_provider.is_distributed = True
+    extra_valid_datasets_provider.is_distributed = True
 
     pretrain(
         train_valid_test_datasets_provider,
@@ -344,5 +342,5 @@ if __name__ == "__main__":
         ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
-        extra_valid_dataset_provider=extra_valid_dataset_provider
+        extra_valid_dataset_provider=extra_valid_datasets_provider
     )

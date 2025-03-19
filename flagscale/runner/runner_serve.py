@@ -1,36 +1,49 @@
+import asyncio
+import contextlib
+import json
 import os
 import shlex
+import signal
 
-import hydra
-from hydra.core.hydra_config import HydraConfig
+import psutil
 from omegaconf import DictConfig, OmegaConf
 
-from flagscale.runner.runner_base import RunnerBase
-from flagscale.runner.runner_utils import (
+from flagscale.runner.runner_base import JobStatus, RunnerBase
+from flagscale.runner.utils import (
+    benchmark,
+    dummy_random_input,
     get_free_port,
-    get_nnodes,
     get_nproc_per_node,
     logger,
     parse_hostfile,
     run_local_command,
-    run_scp_command,
-    run_ssh_command,
 )
 
 
 def _get_args_vllm(config: DictConfig):
     # see the following link for more details
     # https://github.com/facebookresearch/hydra/discussions/2750
-    OmegaConf.set_struct(config, False)
+    config_dict = OmegaConf.to_container(config, resolve=True)
 
-    hydra_config = HydraConfig.get()
-    output_dir = hydra_config.runtime.output_dir
-    output_subdir = hydra_config.output_subdir
-    config_path = os.path.join(output_dir, f"{output_subdir}/config.yaml")
-    config_path = hydra.utils.to_absolute_path(config_path)
+    # step2: restructuring the config
+    # config_dict = config_dict["serve"]
+    config_dict["serve"]["logging"].pop("log_dir")
+    config_dict["serve"]["logging"].pop("scripts_dir")
+    config_dict["serve"]["logging"].pop("pids_dir")
+    if not config_dict["serve"].get("logging"):
+        config_dict["serve"].pop("logging")
+
+    # step3: dict -> yaml
+    logging_config = config.serve.logging
+    new_config = OmegaConf.create(config_dict)
+    new_conf_file = os.path.join(logging_config.scripts_dir, f"serve.yaml")
+
+    # step4: write the new yaml file to `outputs_dir/serve_logs/scripts/serve.yaml`
+    with open(new_conf_file, "w") as f:
+        OmegaConf.save(config=new_config, f=f.name, resolve=True)
 
     args = []
-    args.append(f"--config-path={config_path}")
+    args.append(f"--config-path={new_conf_file}")
 
     return args
 
@@ -54,12 +67,14 @@ def _update_config_serve(config: DictConfig):
     config.serve.logging.scripts_dir = scripts_dir
     config.serve.logging.pids_dir = pids_dir
 
+    os.makedirs(config.serve.logging.scripts_dir, exist_ok=True)
     OmegaConf.set_struct(config, True)
 
 
 def _generate_run_script_serve(
     config, host, node_rank, cmd, background=True, with_test=False
 ):
+    nodes = config.serve.get("nodes", None)
     logging_config = config.serve.logging
 
     no_shared_fs = config.experiment.runner.get("no_shared_fs", False)
@@ -82,35 +97,170 @@ def _generate_run_script_serve(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     )
     cmds_config = config.experiment.get("cmds", None)
+    ssh_port = config.experiment.runner.get("ssh_port", 22)
+    docker_name = config.experiment.runner.get("docker", None)
     if cmds_config:
-        before_start = cmds_config.get("before_start", "")
+        before_start_cmd = cmds_config.get("before_start", "")
     else:
-        before_start = ""
+        before_start_cmd = ""
     cmd += f" --log-dir={logging_config.log_dir}"
+    try:
+        import vllm
+
+        vllm_path = os.path.dirname(vllm.__path__[0])
+    except Exception as e:
+        vllm_path = f"{root_dir}/vllm"
     with open(host_run_script_file, "w") as f:
         f.write("#!/bin/bash\n\n")
         f.write("set -x\n")
-        f.write(f"{before_start}\n")
+        f.write(f"\n")
+        f.write(f"{before_start_cmd}\n")
+        f.write(f"\n")
+
+        f.write(f'if [ -z "$PYTHONPATH" ]; then\n')
+        f.write(f"    export PYTHONPATH={vllm_path}:{root_dir}\n")
+        f.write(f"else\n")
+        f.write(f'    export PYTHONPATH="$PYTHONPATH:{vllm_path}:{root_dir}"\n')
+        f.write(f"fi\n")
+        f.write(f"\n")
+
+        if nodes:
+            f.write(f"ray_path=$(realpath $(which ray))\n")
+            master_ip = nodes[0][0]
+            target_port = nodes[0][1].get("port")
+
+            f.write(f"# clean nodes \n")
+            if len(nodes) > 1:
+                for ip, node in nodes[1:]:
+                    if not node.get("type", None):
+                        raise ValueError(
+                            f"Node type must be specified for node {node}. Available types are 'cpu', 'gpu', or a custom resource name."
+                        )
+                    if not node.get("slots", None):
+                        raise ValueError(
+                            f"Number of slots must be specified for node {node}. This can be done by setting the 'slots' attribute."
+                        )
+                    node_cmd = f"${{ray_path}} stop"
+
+                    if before_start_cmd:
+                        node_cmd = f"{before_start_cmd} && " + node_cmd
+
+                    ssh_cmd = f'ssh -n -p {ssh_port} {ip} "{node_cmd}"'
+
+                    if docker_name:
+                        ssh_cmd = f"ssh -n -p {ssh_port} {ip} \"docker exec {docker_name} /bin/bash -c '{node_cmd}'\""
+                    f.write(f"{ssh_cmd}\n")
+            if before_start_cmd:
+                f.write(f"{before_start_cmd} && ${{ray_path}} stop\n")
+            else:
+                f.write(f"${{ray_path}} stop\n")
+            f.write(f"\n")
+
+            master_port = target_port if target_port else get_free_port()
+
+            address = f"{master_ip}:{master_port}"
+            for index, (ip, node) in enumerate(nodes):
+                if not node.get("type", None):
+                    raise ValueError(
+                        f"Node type must be specified for node {node}. Available types are 'cpu', 'gpu', or a custom resource name."
+                    )
+                if not node.get("slots", None):
+                    raise ValueError(
+                        f"Number of slots must be specified for node {node}. This can be done by setting the 'slots' attribute."
+                    )
+                if index == 0:
+                    # master node
+                    f.write(f"# start cluster\n")
+                    f.write(f"# master node\n")
+                    if node.type == "gpu":
+                        node_cmd = f"${{ray_path}} start --head --port={master_port} --num-gpus={node.slots}"
+                    elif node.type == "cpu":
+                        node_cmd = f"${{ray_path}} start --head --port={master_port} --num-cpus={node.slots}"
+                    else:
+                        resource = json.dumps({node.type: node.slots}).replace(
+                            '"', '\\"'
+                        )
+                        node_cmd = f"${{ray_path}} start --head --port={master_port} --resources='{resource}'"
+                    if before_start_cmd:
+                        node_cmd = f"{before_start_cmd} && " + node_cmd
+                    f.write(f"{node_cmd}\n")
+
+                else:
+                    # worker nodes
+                    if index == 1:
+                        f.write(f"\n")
+                        f.write(f"# worker nodes\n")
+                    if node.type == "gpu":
+                        node_cmd = f"${{ray_path}} start --address={address} --num-gpus={node.slots}"
+
+                    elif node.type == "cpu":
+                        node_cmd = f"${{ray_path}} start --address={address} --num-cpus={node.slots}"
+                    else:
+                        resource = json.dumps({node.type: node.slots}).replace(
+                            '"', '\\"'
+                        )
+                        node_cmd = f"${{ray_path}} start --address={address} --resources='{resource}'"
+                    if before_start_cmd:
+                        node_cmd = f"{before_start_cmd} && " + node_cmd
+
+                    ssh_cmd = f'ssh -n -p {ssh_port} {ip} "{node_cmd}"'
+
+                    if docker_name:
+                        ssh_cmd = f"ssh -n -p {ssh_port} {ip} \"docker exec {docker_name} /bin/bash -c '{node_cmd}'\""
+                    f.write(f"{ssh_cmd}\n")
+        else:
+            # Note: config key device_type is specified for single node serving in neither gpu or cpu.
+            device_type = None
+            nproc_per_node = None
+            if config.experiment.get("runner", None) and config.experiment.runner.get(
+                "device_type", None
+            ):
+                device_type = config.experiment.runner.get("device_type", None)
+                nproc_per_node = config.experiment.runner.get("nproc_per_node", None)
+                if nproc_per_node is None:
+                    raise ValueError(
+                        f"nproc_per_node must be specified when device_type {device_type} is specified."
+                    )
+            node_cmd = None
+            if getattr(config.serve.deploy, "use_native_serve", True) and getattr(
+                config.serve.deploy, "command_line_mode", False
+            ):
+                f.write(f"ray_path=$(realpath $(which ray))\n")
+                if not device_type:
+                    node_cmd = f"${{ray_path}} start --head"
+                elif device_type == "gpu":
+                    node_cmd = f"${{ray_path}} start --head --num-gpus={nproc_per_node}"
+                elif device_type == "cpu":
+                    node_cmd = f"${{ray_path}} start --head --num-cpus={nproc_per_node}"
+                else:
+                    resource = json.dumps({device_type: nproc_per_node}).replace(
+                        '"', '\\"'
+                    )
+                    node_cmd = f"${{ray_path}} start --head --resources='{resource}'"
+            if before_start_cmd:
+                node_cmd = (
+                    f"{before_start_cmd} && {node_cmd}"
+                    if node_cmd
+                    else before_start_cmd
+                )
+            if node_cmd:
+                f.write(f"{node_cmd}\n")
+
         f.write(f"mkdir -p {logging_config.log_dir}\n")
         f.write(f"mkdir -p {logging_config.pids_dir}\n")
         f.write(f"\n")
         f.write(f"cd {root_dir}\n")
         f.write(f"\n")
-        f.write(f"export PYTHONPATH={root_dir}\n")
-        f.write(f"\n")
         f.write(f'cmd="{cmd}"\n')
         f.write(f"\n")
-        if with_test:
-            f.write(f'bash -c "$cmd; sync" \n')
+        # TODO: need a option to control whether to append or overwrite the output file
+        # Now, it always appends to the output file
+        if background:
+            f.write(
+                f'nohup bash -c "$cmd; sync" >> {host_output_file} 2>&1 & echo $! > {host_pid_file}\n'
+            )
         else:
-            # TODO: need a option to control whether to append or overwrite the output file
-            # Now, it always appends to the output file
-            if background:
-                f.write(
-                    f'nohup bash -c "$cmd; sync" >> {host_output_file} 2>&1 & echo $! > {host_pid_file}\n'
-                )
-            else:
-                f.write(f'bash -c "$cmd; sync" >> {host_output_file} 2>&1\n')
+            f.write(f'bash -c "$cmd; sync" >> {host_output_file} 2>&1\n')
         f.write("\n")
         f.flush()
         os.fsync(f.fileno())
@@ -139,7 +289,8 @@ def _generate_stop_script(config, host, node_rank):
         after_stop = ""
     with open(host_stop_script_file, "w") as f:
         f.write("#!/bin/bash\n\n")
-        f.write("pkill -f 'python'\n")
+        f.write("ray stop\n")
+        f.write("pkill -f 'vllm'\n")
         f.write(f"{after_stop}\n")
         f.flush()
         os.fsync(f.fileno())
@@ -148,27 +299,75 @@ def _generate_stop_script(config, host, node_rank):
     return host_stop_script_file
 
 
+def kill_process_tree(pid):
+    try:
+        parent = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return
+
+    # Get all children recursively
+    children = parent.children(recursive=True)
+
+    # Send SIGKILL to all children first
+    for child in children:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(child.pid, signal.SIGKILL)
+
+    # Finally kill the parent
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+
+
 class SSHServeRunner(RunnerBase):
     def __init__(self, config: DictConfig):
         super().__init__(config)
         self.task_type = getattr(self.config.experiment.task, "type", None)
         assert self.task_type == "serve", f"Unsupported task type: {self.task_type}"
         self.command_line_mode = getattr(
-            self.config.serve.deploy, "command-line-mode", None
+            self.config.serve.deploy, "command_line_mode", None
+        )
+        self.use_native_serve = getattr(
+            self.config.serve.deploy, "use_native_serve", True
         )
         self._prepare()
+        self.host = None
+        self.port = (
+            self.config.serve.model_args.vllm_model.get("port", get_free_port())
+            if self.config.serve.get("model_args", None)
+            else get_free_port()
+        )
 
     def _prepare(self):
         _update_config_serve(self.config)
         self.user_args = _get_args_vllm(self.config)
         self.user_envs = self.config.experiment.get("envs", {})
+        entrypoint = self.config.experiment.task.get("entrypoint", None)
         if self.command_line_mode:
-            self.user_script = "flagscale/serve/run_vllm.py"
+            if not self.use_native_serve:
+                self.user_script = "flagscale/serve/run_serve_engine.py"
+            else:
+                self.user_script = "flagscale/serve/run_vllm.py"
+        elif isinstance(entrypoint, str) and entrypoint.endswith(".py"):
+            self.user_script = entrypoint
+        elif entrypoint is None:
+            self.user_script = "flagscale/serve/run_serve.py"
         else:
-            self.user_script = self.config.experiment.task.entrypoint
-        self.resources = parse_hostfile(
-            self.config.experiment.runner.get("hostfile", None)
-        )
+            raise ValueError(
+                f"Invalid config entrypoint: {entrypoint}, must be a python file path or null."
+            )
+        hostfile_path = self.config.experiment.runner.get("hostfile", None)
+        if hostfile_path:
+            if os.path.isabs(hostfile_path):
+                hostfile_path = hostfile_path
+            else:
+                hostfile_path = os.path.join(os.getcwd(), hostfile_path)
+            if not os.path.exists(hostfile_path):
+                raise ValueError(f"The hostfile {hostfile_path} does not exist")
+
+        self.resources = parse_hostfile(hostfile_path)
+        if self.resources:
+            OmegaConf.set_struct(self.config, False)
+            self.config.serve["nodes"] = list(self.resources.items())
         logger.info("\n************** configuration **************")
         logger.info(f"\n{OmegaConf.to_yaml(self.config)}")
 
@@ -189,33 +388,11 @@ class SSHServeRunner(RunnerBase):
 
         cmd = shlex.join(export_cmd + ["python"] + [self.user_script] + self.user_args)
 
-        logging_config = self.config.serve.logging
         host_run_script_file = _generate_run_script_serve(
             self.config, host, node_rank, cmd, background=True, with_test=with_test
         )
 
-        if host != "localhost":
-            ssh_port = self.config.experiment.runner.get("ssh_port", 22)
-            # Step 1: make sure the scripts_dir exists on the remote host
-            run_ssh_command(
-                host, f"mkdir -p {logging_config.scripts_dir}", ssh_port, dryrun
-            )
-
-            # Step 2: copy the host_run_script_file to the remote host
-            no_shared_fs = self.config.experiment.runner.get("no_shared_fs", False)
-            if no_shared_fs:
-                run_scp_command(
-                    host,
-                    host_run_script_file,
-                    logging_config.scripts_dir,
-                    ssh_port,
-                    dryrun,
-                )
-
-            # Step 3: run the host_run_script_file on the remote host
-            run_ssh_command(host, f"bash {host_run_script_file}", ssh_port, dryrun)
-        else:
-            run_local_command(f"bash {host_run_script_file}", dryrun)
+        run_local_command(f"bash {host_run_script_file}", dryrun)
 
     def run(self, with_test=False, dryrun=False):
         num_visible_devices = None
@@ -226,81 +403,141 @@ class SSHServeRunner(RunnerBase):
 
         runner_config = self.config.experiment.runner
 
-        # If hostfile is provided, use the resources from the hostfile
-        if self.resources is not None:
-            nnodes_from_hostfile = len(self.resources.keys())
-            nnodes_from_args = runner_config.get("nnodes", None)
-            nnodes = get_nnodes(nnodes_from_hostfile, nnodes_from_args)
-            available_ip = list(self.resources.keys())[0]
-            available_port = get_free_port()
-            for node_rank, (host, resource_info) in enumerate(self.resources.items()):
-                if node_rank >= nnodes:
-                    break
-                nproc_from_hostfile = resource_info["slots"]
-                nproc_from_args = runner_config.get("nproc_per_node", None)
-                nproc_per_node = get_nproc_per_node(
-                    nproc_from_hostfile, nproc_from_args, num_visible_devices
-                )
-                master_addr = runner_config.get("master_addr", available_ip)
-                master_port = runner_config.get("master_port", available_port)
-                self._run_each(
-                    host,
-                    master_addr,
-                    master_port,
-                    nnodes,
-                    node_rank,
-                    nproc_per_node,
-                    with_test=with_test,
-                    dryrun=dryrun,
-                )
-        else:
-            # If hostfile is not provided, run the job on localhost
-            nproc_from_args = runner_config.get("nproc_per_node", None)
-            nproc_per_node = get_nproc_per_node(
-                None, nproc_from_args, num_visible_devices
-            )
-            available_addr = runner_config.get("master_addr", "localhost")
-            available_port = runner_config.get("master_port", get_free_port())
-            self._run_each(
-                "localhost",
-                available_addr,
-                available_port,
-                1,
-                0,
-                nproc_per_node,
-                with_test=with_test,
-                dryrun=dryrun,
-            )
+        # If hostfile is not provided, run the job on localhost
+        nproc_from_args = runner_config.get("nproc_per_node", None)
+        nproc_per_node = get_nproc_per_node(None, nproc_from_args, num_visible_devices)
+        available_addr = runner_config.get("master_addr", "localhost")
+        available_port = runner_config.get("master_port", get_free_port())
+        self._run_each(
+            "localhost",
+            available_addr,
+            available_port,
+            1,
+            0,
+            nproc_per_node,
+            with_test=with_test,
+            dryrun=dryrun,
+        )
+        self.host = available_addr
 
     def _stop_each(self, host, node_rank):
-        host_stop_script_file = _generate_stop_script(self.config, host, node_rank)
         logging_config = self.config.serve.logging
-
-        if host != "localhost":
-            ssh_port = self.config.experiment.runner.get("ssh_port", 22)
-            # Step 1: make sure the scripts_dir exists on the remote host
-            run_ssh_command(host, f"mkdir -p {logging_config.scripts_dir}", ssh_port)
-            # Step 2: copy the host_run_script_file to the remote host
-            no_shared_fs = self.config.experiment.runner.get("no_shared_fs", False)
-            if no_shared_fs:
-                run_scp_command(
-                    host, host_stop_script_file, logging_config.scripts_dir, ssh_port
-                )
-            # Step 3: run the host_run_script_file on the remote host
-            run_ssh_command(host, f"bash {host_stop_script_file}", ssh_port)
-        else:
-            run_local_command(f"bash {host_stop_script_file}")
+        host_pid_file = os.path.join(
+            logging_config.pids_dir, f"host_{node_rank}_{host}.pid"
+        )
+        with open(host_pid_file, "r") as f:
+            pid = f.readlines()[0]
+            pid = int(pid.strip())
+        kill_process_tree(pid)
 
     def stop(self):
-        if self.resources is None:
-            self._stop_each("localhost", 0)
-            return
+        self._stop_each("localhost", 0)
+        return
 
-        nnodes = get_nnodes(
-            len(self.resources), self.config.experiment.runner.get("nnodes", None)
+    def _generate_query_script(self, host, node_rank):
+        """Genetrate the query script for each host."""
+        logging_config = self.config.serve.logging
+
+        host_query_script_file = os.path.join(
+            logging_config.scripts_dir, f"host_{node_rank}_{host}_query.sh"
         )
 
-        for node_rank, (host, _) in enumerate(self.resources.items()):
-            if node_rank >= nnodes:
-                break
-            self._stop_each(host, node_rank)
+        host_pid_file = os.path.join(
+            logging_config.pids_dir, f"host_{node_rank}_{host}.pid"
+        )
+        os.makedirs(logging_config.scripts_dir, exist_ok=True)
+
+        with open(host_query_script_file, "w") as f:
+            f.write("#!/bin/bash\n\n")
+            f.write("if [ -f " + host_pid_file + " ]; then\n")
+            f.write("    pid=$(cat " + host_pid_file + ")\n")
+            f.write("    ps -p $pid -o state --no-headers\n")
+            f.write("else\n")
+            # TODO: This is a temporary fix. We need to find a better way to query the job.
+            f.write(
+                "    pid=$(ps aux | grep 'run_vllm' | grep -v grep | head -n 1 | awk '{print $2}')\n"
+            )
+            f.write("    ps -p $pid -o state --no-headers\n")
+            f.write("fi\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(host_query_script_file, 0o755)
+
+        return host_query_script_file
+
+    def _query_each(self, host, node_rank):
+        "Query each node status."
+        host_query_script_file = self._generate_query_script(host, node_rank)
+        logging_config = self.config.serve.logging
+        result = ""
+        try:
+            result = run_local_command(f"bash {host_query_script_file}", query=True)
+        except Exception as e:
+            logger.error(f"Failed to query job status on {host}: {e}")
+        result = result.stdout.rstrip() if result else ""
+        return result
+
+    def _query_status(self):
+        "Query Job status."
+        results = []
+        result = self._query_each("localhost", 0)
+        results.append(result)
+        if all((status != "" and status != "Z") for status in results):
+            job_status = JobStatus.RUNNING
+        elif all((status == "" or status == "Z") for status in results):
+            job_status = JobStatus.COMPLETED_OR_IDLE
+        else:
+            job_status = JobStatus.TRANSITIONAL
+        return job_status
+
+    def _serve_alive(self):
+        config = self.config
+        model_name = config.serve.model_args.vllm_model["model-tag"]
+        from openai import OpenAI
+
+        # Modify OpenAI's API key and API base to use vLLM's API server.
+        api_key = "EMPTY"
+        api_url = f"http://{self.host}:{self.port}/v1"
+
+        try:
+            client = OpenAI(
+                api_key=api_key,
+                base_url=api_url,
+            )
+            messages = [{"role": "user", "content": "who are you?"}]
+            response = client.chat.completions.create(
+                model=model_name, messages=messages
+            )
+        except Exception as e:
+            # logger.info(f"API {api_url} is not ready, please wait a moment")
+            return False
+
+        return True
+
+    def _profile_serve(self):
+        from vllm.transformers_utils.tokenizer import get_tokenizer
+
+        model = self.config.serve.model_args.vllm_model["model-tag"]
+        tokenizer_mode = "auto"
+        trust_remote_code = (
+            "trust-remote-code"
+            in self.config.serve.model_args.vllm_model["action-args"]
+        )
+        tokenizer = get_tokenizer(
+            model, tokenizer_mode=tokenizer_mode, trust_remote_code=trust_remote_code
+        )
+        dummy_input_requests = dummy_random_input(tokenizer=tokenizer, num_prompts=1000)
+        api_url = f"http://{self.host}:{self.port}/v1/completions"
+        ### allow metric = [\"ttft\", \"tpot\", \"itl\", \"e2el\"]
+        ### allow percentiles = [\"25,50,75\"]
+        result = asyncio.run(
+            benchmark(
+                api_url,
+                model=model,
+                tokenizer=tokenizer,
+                input_requests=dummy_input_requests,
+                selected_percentile_metrics="ttft,tpot,itl,e2el".split(","),
+                selected_percentiles=[float(99)],
+            )
+        )
+        return result

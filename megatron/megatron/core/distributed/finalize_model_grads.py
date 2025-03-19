@@ -13,9 +13,30 @@ except ImportError:
     HAVE_DTENSOR = False
 
 from .. import parallel_state
+from ..transformer.moe.moe_utils import get_updated_expert_bias
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import get_attr_wrapped_model, get_model_config
 
+
+def _get_main_grad_attr(param: torch.nn.Parameter, use_custom_fsdp: bool = False):
+    if use_custom_fsdp:
+        return "fsdp_managed_main_grad"
+    if hasattr(param, "main_grad"):
+        return "main_grad"
+    return "grad"
+
+def get_device_type_for_comm(model_parallel_group=None):
+    ''''Copy from flagscale/train/hetero/p2p_communication.py'''
+    device = 'cuda'
+    # "cpu:gloo": gloo only supports cpu tensor.
+    # "gloo" & "cpu:gloo,cuda:gloo": gloo supports both cpu and cuda tensor.
+    if isinstance(model_parallel_group, list):
+        if 'cpu:gloo' == torch.distributed.get_backend(model_parallel_group[0]):
+            device = 'cpu'
+    else:
+        if 'cpu:gloo' == torch.distributed.get_backend(model_parallel_group):
+            device = 'cpu'
+    return device
 
 def _unshard_if_dtensor(tensor: Union[torch.Tensor, "DTensor"]) -> torch.Tensor:
     """
@@ -115,10 +136,14 @@ def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: Transf
     sync.
     """
 
-    if (
-        parallel_state.is_rank_in_embedding_group(ignore_virtual=True)
-        and torch.distributed.get_world_size(parallel_state.get_embedding_group()) > 1
-    ):
+    if (parallel_state.is_rank_in_embedding_group(ignore_virtual=True)):
+        embed_group = parallel_state.get_embedding_group()
+        if not isinstance(embed_group, list):
+            embed_group = [embed_group]
+    else:
+        return
+    
+    if (torch.distributed.get_world_size(embed_group[0]) > 1):
         if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
             model_module = model[0]
         elif parallel_state.is_pipeline_last_stage(ignore_virtual=True):
@@ -126,14 +151,97 @@ def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: Transf
         else:  # We do not support an interleaved schedule for models with encoders yet.
             model_module = model[0]
 
+        ddp_config = model_module.ddp_config
+        use_dist_opt = ddp_config.use_distributed_optimizer
         model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
         if model_module.share_embeddings_and_output_weights:
             weight = model_module.shared_embedding_or_output_weight()
-            grad_attr = "main_grad" if hasattr(weight, "main_grad") else "grad"
+            grad_attr = _get_main_grad_attr(weight, ddp_config.use_custom_fsdp)
             orig_grad = getattr(weight, grad_attr)
             grad = _unshard_if_dtensor(orig_grad)
-            torch.distributed.all_reduce(grad, group=parallel_state.get_embedding_group())
+            com_device = get_device_type_for_comm(embed_group)
+            if com_device == "cpu":
+                grad = grad.cpu()
+            if use_dist_opt:
+                if config.use_partial_reduce_for_shared_embedding:
+                    dp_world_size = parallel_state.get_data_parallel_world_size()
+                    dp_rank = parallel_state.get_data_parallel_rank()
+                    assert grad.shape[0] % dp_world_size == 0, f"grad shape: {grad.shape[0]}, dp_world_size: {dp_world_size}"
+                    per_partion_size = grad.shape[0] // dp_world_size
+                    if len(embed_group) == 1:
+                        offset = per_partion_size * dp_rank
+                        torch.distributed.all_reduce(grad[offset:offset+per_partion_size, :], group=embed_group[0])
+                    else:
+                        group_idx = 0
+                        per_partion_size = per_partion_size // len(embed_group)
+                        for group in embed_group:
+                            offset = per_partion_size * (dp_rank * len(embed_group) + group_idx)
+                            torch.distributed.all_reduce(grad[offset : offset + per_partion_size, :], group=group)
+                            group_idx += 1
+                else: # megartron default method
+                    torch.distributed.all_reduce(grad, group=embed_group[0])
+            else:
+                if len(embed_group) == 1: # megartron default method
+                    torch.distributed.all_reduce(grad, group=embed_group[0])
+                else:
+                    original_grad_data = grad.clone().detach().data
+                    for group in embed_group:
+                        grad.data.copy_(original_grad_data)
+                        torch.distributed.all_reduce(grad, group=group)
+            if grad.device == torch.device('cpu'):
+                grad.to(torch.cuda.current_device())
             setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
+
+        if getattr(model_module, "use_mtp_predictor", None):
+            weight = model_module.shared_embedding_or_mtp_embedding()
+            grad_attr = _get_main_grad_attr(weight, ddp_config.use_custom_fsdp)
+            orig_grad = getattr(weight, grad_attr)
+            grad = _unshard_if_dtensor(orig_grad)
+            com_device = get_device_type_for_comm(embed_group)
+            if com_device == "cpu":
+                grad = grad.cpu()
+            if use_dist_opt:
+                if config.use_partial_reduce_for_shared_embedding:
+                    dp_world_size = parallel_state.get_data_parallel_world_size()
+                    dp_rank = parallel_state.get_data_parallel_rank()
+                    assert grad.shape[0] % dp_world_size == 0, f"grad shape: {grad.shape[0]}, dp_world_size: {dp_world_size}"
+                    per_partion_size = grad.shape[0] // dp_world_size
+                    if len(embed_group) == 1:
+                        offset = per_partion_size * dp_rank
+                        torch.distributed.all_reduce(grad[offset:offset+per_partion_size, :], group=embed_group[0])
+                    else:
+                        group_idx = 0
+                        per_partion_size = per_partion_size // len(embed_group)
+                        for group in embed_group:
+                            offset = per_partion_size * (dp_rank * len(embed_group) + group_idx)
+                            torch.distributed.all_reduce(grad[offset : offset + per_partion_size, :], group=group)
+                            group_idx += 1
+                else: # megartron default method
+                    torch.distributed.all_reduce(grad, group=embed_group[0])
+            else:
+                if len(embed_group) == 1: # megartron default method
+                    torch.distributed.all_reduce(grad, group=embed_group[0])
+                else:
+                    original_grad_data = grad.clone().detach().data
+                    for group in embed_group:
+                        grad.data.copy_(original_grad_data)
+                        torch.distributed.all_reduce(grad, group=group)
+            if grad.device == torch.device('cpu'):
+                grad.to(torch.cuda.current_device())
+            setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
+
+            # Note: If the system supports both the sharing of the embedding and the output layer within the main model,
+            # as well as the sharing of the embedding in the main model with the embedding in the MTP predictor,
+            # it is necessary to copy the data to the main model's output layer after two all-reduce synchronizations.
+            # Since the main model output layer and the MTP embedding are both located in the last PP stage,
+            # the data from the MTP embedding can be directly copied to the main model output layer.
+            if model_module.share_embeddings_and_output_weights:
+                output_layer_weight = model_module.shared_embedding_or_output_weight()
+                mtp_embedding_weight = model_module.shared_embedding_or_mtp_embedding()
+                orig_mtp_embedding_grad = getattr(mtp_embedding_weight, grad_attr)
+                mtp_embedding_grad = _unshard_if_dtensor(orig_mtp_embedding_grad)
+                orig_output_layer_grad = getattr(output_layer_weight, grad_attr)
+                setattr(output_layer_weight, grad_attr, _reshard_if_dtensor(mtp_embedding_grad, orig_output_layer_grad))
 
 
 def _allreduce_position_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig):
@@ -152,10 +260,11 @@ def _allreduce_position_embedding_grads(model: List[torch.nn.Module], config: Tr
         else:  # We do not support an interleaved schedule for models with encoders yet.
             model_module = model[0]
 
+        ddp_config = model_module.ddp_config
         model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
         assert hasattr(model_module, 'position_embeddings')
         weight = model_module.position_embeddings.weight
-        grad_attr = "main_grad" if hasattr(weight, "main_grad") else "grad"
+        grad_attr = _get_main_grad_attr(weight, ddp_config.use_custom_fsdp)
         orig_grad = getattr(weight, grad_attr)
         grad = _unshard_if_dtensor(orig_grad)
         torch.distributed.all_reduce(grad, group=parallel_state.get_position_embedding_group())
@@ -184,16 +293,13 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
         grads = []
         for model_chunk in model:
             for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
-                if not param.requires_grad:
-                    continue
-                if (
-                    param.requires_grad
-                    and getattr(param, 'sequence_parallel', False)
+                if param.requires_grad and (
+                    getattr(param, 'sequence_parallel', False)
                     or 'q_layernorm' in name
                     or 'k_layernorm' in name
                 ):
                     params.append(param)
-                    grad_attr = "main_grad" if hasattr(param, "main_grad") else "grad"
+                    grad_attr = _get_main_grad_attr(param, config.use_custom_fsdp)
                     grad = getattr(param, grad_attr)
                     grad = _unshard_if_dtensor(grad)
                     grads.append(grad.data)
@@ -206,9 +312,37 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
                 params, grads, _unflatten_dense_tensors(coalesced, grads)
             ):
                 buf.copy_(synced)
-                grad_attr = "main_grad" if hasattr(param, "main_grad") else "grad"
+                grad_attr = _get_main_grad_attr(param, config.use_custom_fsdp)
                 orig_grad = getattr(param, grad_attr)
                 setattr(param, grad_attr, _reshard_if_dtensor(buf, orig_grad))
+
+
+def _update_router_expert_bias(model: List[torch.nn.Module], config: TransformerConfig):
+    """
+    Update the expert bias of the router for a global batch.
+    This requires all-reduce of local_tokens_per_expert across TPxCPxDP ranks
+    """
+    tokens_per_expert_list = []
+    expert_bias_list = []
+    for model_chunk in model:
+        for module in get_attr_wrapped_model(model_chunk, 'modules')():
+            if hasattr(module, 'expert_bias'):
+                tokens_per_expert_list.append(module.local_tokens_per_expert)
+                expert_bias_list.append(module.expert_bias)
+    # For hybrid models with both MoE and Dense layers, this list can be empty.
+    if len(expert_bias_list) == 0:
+        return
+    stacked_tokens_per_expert = torch.stack(tokens_per_expert_list, dim=0)
+    stacked_expert_bias = torch.stack(expert_bias_list, dim=0)
+    stacked_updated_expert_bias = get_updated_expert_bias(
+        stacked_tokens_per_expert, stacked_expert_bias, config.moe_router_bias_update_rate
+    )
+
+    for tokens_per_expert, expert_bias, updated_expert_bias in zip(
+        tokens_per_expert_list, expert_bias_list, stacked_updated_expert_bias
+    ):
+        tokens_per_expert.zero_()
+        expert_bias.copy_(updated_expert_bias)
 
 
 def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torch.Tensor] = None):
@@ -255,6 +389,9 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce').stop()
 
+    if config.moe_router_enable_expert_bias:
+        _update_router_expert_bias(model, config)
+
     # normalize gradients for per-token loss normalization.
     # if we are using by the number of tokens, then we use that as a divisor. this number
     # will be the total number of non-padded tokens in the global batch.
@@ -277,7 +414,7 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
             pp_group = [pp_group]
 
         # need to do a broadcast for every pp group, even though num_tokens should be the same.
-        if "gloo" in pp_group[0].name():
+        if "cpu:gloo" == pp_group[0].name():
             num_tokens = num_tokens.cpu()
 
         num_tokens_list = []

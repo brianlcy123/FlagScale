@@ -15,6 +15,7 @@ from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
+from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.models.mamba import MambaModel
 from megatron.training import pretrain
 from megatron.core.utils import StragglerDetector
@@ -102,6 +103,11 @@ def get_batch(data_iterator):
 
     return batch.values()
 
+
+# define spiky loss as a loss that's 10x the max loss observed
+SPIKY_LOSS_FACTOR = 10
+
+
 def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     """Loss function.
 
@@ -126,20 +132,46 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
         torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
+    rerun_state_machine = get_rerun_state_machine()
     if args.check_for_nan_in_loss_and_grad:
-        global_rank = torch.distributed.get_rank()
-        assert not loss[0].isnan(), (
-            f'Rank {global_rank}: found NaN in local forward loss calculation. '
-            f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
+        rerun_state_machine.validate_result(
+            result=loss[0],
+            rejection_func=torch.isnan,
+            message="found NaN in local forward loss calculation",
+            tolerance=0.0,        # forward pass calculations are determinisic
+            fatal=True,
+        )
+        rerun_state_machine.validate_result(
+            result=loss[0],
+            rejection_func=torch.isinf,
+            message="found Inf in local forward loss calculation",
+            tolerance=0.0,        # forward pass calculations are determinisic
+            fatal=True,
+        )
+    # Check for spiky loss
+    if args.check_for_spiky_loss:
+        rerun_state_machine.validate_result(
+            result=loss[0],
+            rejection_func=partial(
+                rerun_state_machine.is_unexpectedly_large,
+                threshold=SPIKY_LOSS_FACTOR,
+                context="loss",
+            ),
+            message="Spiky loss",
+            tolerance=0.0,        # forward pass calculations are determinisic
+            fatal=False,
         )
 
     # Reduce loss for logging.
     reporting_loss = loss.clone().detach()
     torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
 
+    # loss[0] is a view of loss, so it has ._base not None, which triggers assert error
+    # in core/pipeline_parallel/schedule.py::deallocate_output_tensor, calling .clone()
+    # on loss[0] fixes this
     local_num_tokens = loss[1].clone().detach().to(torch.int)
     return (
-        loss[0] * args.context_parallel_size,
+        loss[0].clone(),
         local_num_tokens,
         {'lm loss': (reporting_loss[0], reporting_loss[1])},
     )
@@ -189,7 +221,6 @@ def core_gpt_dataset_config_from_args(args):
         sequence_length=args.seq_length,
         blend=blend,
         blend_per_split=blend_per_split,
-        renormalize_blend_weights=args.renormalize_blend_weights,
         split=args.split,
         num_dataset_builder_threads=args.num_dataset_builder_threads,
         path_to_cache=args.data_cache_path,
